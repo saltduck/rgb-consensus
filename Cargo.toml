@@ -83,5 +83,11 @@ getrandom = { version = "0.3", features = [
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+[patch.crates-io]
+rgb-aluvm = { git = "https://github.com/saltduck/rgb-aluvm", branch = "outstack", features = [
+    "rgb-ascii-armor",
+    "std",
+]}
+
 [package.metadata.docs.rs]
 features = ["all"]
