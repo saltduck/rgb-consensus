@@ -30,9 +30,11 @@ use std::ops::RangeInclusive;
 
 use aluvm::isa::{Bytecode, BytecodeError, ExecStep, InstructionSet};
 use aluvm::library::{CodeEofError, IsaSeg, LibSite, Read, Write};
-use aluvm::reg::{CoreRegs, Reg, Reg16, Reg32, RegA, RegS};
+use aluvm::reg::{CoreRegs, Reg, Reg16, Reg32, RegA, RegR, RegS};
 use amplify::num::{u24, u3, u4};
 use amplify::Wrapper;
+use bitcoin::hashes::Hash as _;
+use bitcoin::{OutPoint as Outpoint, Txid};
 use secp256k1::{ecdsa, Message, PublicKey};
 
 use super::opcodes::*;
@@ -135,6 +137,35 @@ pub enum ContractOp<S: ContractStateAccess> {
     #[display("ldm     {0},{1}")]
     LdM(MetaType, RegS),
 
+    /// Loads owned fungible state from the contract state at a specified
+    /// outpoint. The outpoint is composed from `r256` register (txid) and
+    /// `a32` register (vout). Item index is taken from `a16` register.
+    /// Result is written to destination `a64` register.
+    ///
+    /// If the outpoint has no fungible state of the given type, or the
+    /// index is out of range, sets `st0` to fail state and stops execution.
+    #[display("ldof    {0},r256{1},a32{2},a16{3},a64{4}")]
+    LdOF(AssignmentType, Reg16, Reg16, Reg16, Reg16),
+
+    /// Loads owned structured data state from the contract state at a
+    /// specified outpoint. The outpoint is composed from `r256` register
+    /// (txid) and `a32` register (vout). Item index is taken from `a16`
+    /// register. Result is written to destination `s16` register.
+    ///
+    /// If the outpoint has no data state of the given type, or the index
+    /// is out of range, sets `st0` to fail state and stops execution.
+    #[display("ldod    {0},r256{1},a32{2},a16{3},{4}")]
+    LdOD(AssignmentType, Reg16, Reg16, Reg16, RegS),
+
+    /// Loads owned rights count from the contract state at a specified
+    /// outpoint. The outpoint is composed from `r256` register (txid) and
+    /// `a32` register (vout). Result (u32 count) is written to destination
+    /// `a32` register.
+    ///
+    /// Does not fail if no rights exist; writes zero instead.
+    #[display("ldor    {0},r256{1},a32{2},a32{3}")]
+    LdOR(AssignmentType, Reg16, Reg16, Reg16),
+
     /// Verify sum of inputs and outputs are equal.
     ///
     /// The only argument specifies owned state type for the sum operation. If
@@ -198,6 +229,16 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
             | ContractOp::LdS(_, reg, _) => bset![Reg::A(RegA::A16, (*reg).into())],
             ContractOp::LdG(_, reg, _) => bset![Reg::A(RegA::A8, (*reg).into())],
             ContractOp::LdC(_, reg, _) => bset![Reg::A(RegA::A32, (*reg).into())],
+            ContractOp::LdOF(_, txid_reg, vout_reg, idx_reg, _)
+            | ContractOp::LdOD(_, txid_reg, vout_reg, idx_reg, _) => bset![
+                Reg::R(RegR::R256, (*txid_reg).into()),
+                Reg::A(RegA::A32, (*vout_reg).into()),
+                Reg::A(RegA::A16, (*idx_reg).into())
+            ],
+            ContractOp::LdOR(_, txid_reg, vout_reg, _) => bset![
+                Reg::R(RegR::R256, (*txid_reg).into()),
+                Reg::A(RegA::A32, (*vout_reg).into())
+            ],
 
             ContractOp::CnP(_, _)
             | ContractOp::CnS(_, _)
@@ -221,14 +262,18 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
             ContractOp::CnP(_, reg) | ContractOp::CnS(_, reg) | ContractOp::CnC(_, reg) => {
                 bset![Reg::A(RegA::A16, *reg)]
             }
-            ContractOp::LdF(_, _, reg) => {
+            ContractOp::LdF(_, _, reg) | ContractOp::LdOF(_, _, _, _, reg) => {
                 bset![Reg::A(RegA::A64, (*reg).into())]
+            }
+            ContractOp::LdOR(_, _, _, reg) => {
+                bset![Reg::A(RegA::A32, (*reg).into())]
             }
             ContractOp::LdG(_, _, reg)
             | ContractOp::LdS(_, _, reg)
             | ContractOp::LdP(_, _, reg)
             | ContractOp::LdC(_, _, reg)
-            | ContractOp::LdM(_, reg) => {
+            | ContractOp::LdM(_, reg)
+            | ContractOp::LdOD(_, _, _, _, reg) => {
                 bset![Reg::S(*reg)]
             }
             ContractOp::Svs(_) | ContractOp::Sas(_) | ContractOp::Sps(_) => {
@@ -249,7 +294,10 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
             | ContractOp::LdS(_, _, _)
             | ContractOp::LdF(_, _, _)
             | ContractOp::LdG(_, _, _)
-            | ContractOp::LdC(_, _, _) => 8,
+            | ContractOp::LdC(_, _, _)
+            | ContractOp::LdOF(_, _, _, _, _)
+            | ContractOp::LdOD(_, _, _, _, _)
+            | ContractOp::LdOR(_, _, _, _) => 8,
             ContractOp::LdM(_, _) => 6,
             ContractOp::Svs(_) | ContractOp::Sas(_) | ContractOp::Sps(_) => 20,
             ContractOp::Vts(_) => 512,
@@ -432,6 +480,75 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
                 };
                 regs.set_s16(*reg, meta.to_inner());
             }
+            ContractOp::LdOF(assign_type, txid_reg, vout_reg, idx_reg, dst_reg) => {
+                let Some(txid_num) = *regs.get_n(RegR::R256, *txid_reg) else {
+                    fail!()
+                };
+                let mut txid_arr = [0u8; 32];
+                txid_arr.copy_from_slice(txid_num.as_ref());
+                let txid = Txid::from_byte_array(txid_arr);
+
+                let Some(vout_num) = *regs.get_n(RegA::A32, *vout_reg) else {
+                    fail!()
+                };
+                let vout: u32 = vout_num.into();
+                let outpoint = Outpoint::new(txid, vout);
+
+                let Some(idx_num) = *regs.get_n(RegA::A16, *idx_reg) else {
+                    fail!()
+                };
+                let index: u16 = idx_num.into();
+
+                let state = RefCell::borrow(&context.contract_state);
+                let Some(fungible) = state.fungible(outpoint, *assign_type).nth(index as usize)
+                else {
+                    fail!()
+                };
+                regs.set_n(RegA::A64, *dst_reg, fungible.as_u64());
+            }
+            ContractOp::LdOD(assign_type, txid_reg, vout_reg, idx_reg, dst_reg) => {
+                let Some(txid_num) = *regs.get_n(RegR::R256, *txid_reg) else {
+                    fail!()
+                };
+                let mut txid_arr = [0u8; 32];
+                txid_arr.copy_from_slice(txid_num.as_ref());
+                let txid = Txid::from_byte_array(txid_arr);
+
+                let Some(vout_num) = *regs.get_n(RegA::A32, *vout_reg) else {
+                    fail!()
+                };
+                let vout: u32 = vout_num.into();
+                let outpoint = Outpoint::new(txid, vout);
+
+                let Some(idx_num) = *regs.get_n(RegA::A16, *idx_reg) else {
+                    fail!()
+                };
+                let index: u16 = idx_num.into();
+
+                let state = RefCell::borrow(&context.contract_state);
+                let Some(data) = state.data(outpoint, *assign_type).nth(index as usize) else {
+                    fail!()
+                };
+                regs.set_s16(*dst_reg, data.borrow().as_inner());
+            }
+            ContractOp::LdOR(assign_type, txid_reg, vout_reg, dst_reg) => {
+                let Some(txid_num) = *regs.get_n(RegR::R256, *txid_reg) else {
+                    fail!()
+                };
+                let mut txid_arr = [0u8; 32];
+                txid_arr.copy_from_slice(txid_num.as_ref());
+                let txid = Txid::from_byte_array(txid_arr);
+
+                let Some(vout_num) = *regs.get_n(RegA::A32, *vout_reg) else {
+                    fail!()
+                };
+                let vout: u32 = vout_num.into();
+                let outpoint = Outpoint::new(txid, vout);
+
+                let state = RefCell::borrow(&context.contract_state);
+                let rights = state.rights(outpoint, *assign_type);
+                regs.set_n(RegA::A32, *dst_reg, rights);
+            }
             ContractOp::Svs(state_type) => {
                 let Some(input_amt) = load_revealed_inputs!(state_type)
                     .iter()
@@ -535,6 +652,9 @@ impl<S: ContractStateAccess> Bytecode for ContractOp<S> {
             ContractOp::LdF(_, _, _) => INSTR_LDF,
             ContractOp::LdC(_, _, _) => INSTR_LDC,
             ContractOp::LdM(_, _) => INSTR_LDM,
+            ContractOp::LdOF(_, _, _, _, _) => INSTR_LDOF,
+            ContractOp::LdOD(_, _, _, _, _) => INSTR_LDOD,
+            ContractOp::LdOR(_, _, _, _) => INSTR_LDOR,
 
             ContractOp::Svs(_) => INSTR_SVS,
             ContractOp::Sas(_) => INSTR_SAS,
@@ -597,6 +717,27 @@ impl<S: ContractStateAccess> Bytecode for ContractOp<S> {
             ContractOp::LdM(state_type, reg) => {
                 writer.write_u16(*state_type)?;
                 writer.write_u4(reg)?;
+                writer.write_u4(u4::ZERO)?;
+            }
+            ContractOp::LdOF(state_type, txid_reg, vout_reg, idx_reg, dst_reg) => {
+                writer.write_u16(*state_type)?;
+                writer.write_u4(txid_reg)?;
+                writer.write_u4(vout_reg)?;
+                writer.write_u4(idx_reg)?;
+                writer.write_u4(dst_reg)?;
+            }
+            ContractOp::LdOD(state_type, txid_reg, vout_reg, idx_reg, dst_reg) => {
+                writer.write_u16(*state_type)?;
+                writer.write_u4(txid_reg)?;
+                writer.write_u4(vout_reg)?;
+                writer.write_u4(idx_reg)?;
+                writer.write_u4(dst_reg)?;
+            }
+            ContractOp::LdOR(state_type, txid_reg, vout_reg, dst_reg) => {
+                writer.write_u16(*state_type)?;
+                writer.write_u4(txid_reg)?;
+                writer.write_u4(vout_reg)?;
+                writer.write_u4(dst_reg)?;
                 writer.write_u4(u4::ZERO)?;
             }
 
@@ -668,6 +809,30 @@ impl<S: ContractStateAccess> Bytecode for ContractOp<S> {
                 reader.read_u4()?; // Discard garbage bits
                 i
             }
+            INSTR_LDOF => Self::LdOF(
+                reader.read_u16()?.into(),
+                reader.read_u4()?.into(),
+                reader.read_u4()?.into(),
+                reader.read_u4()?.into(),
+                reader.read_u4()?.into(),
+            ),
+            INSTR_LDOD => Self::LdOD(
+                reader.read_u16()?.into(),
+                reader.read_u4()?.into(),
+                reader.read_u4()?.into(),
+                reader.read_u4()?.into(),
+                reader.read_u4()?.into(),
+            ),
+            INSTR_LDOR => {
+                let i = Self::LdOR(
+                    reader.read_u16()?.into(),
+                    reader.read_u4()?.into(),
+                    reader.read_u4()?.into(),
+                    reader.read_u4()?.into(),
+                );
+                reader.read_u4()?; // Discard padding bits
+                i
+            }
 
             INSTR_SVS => Self::Svs(reader.read_u16()?.into()),
             INSTR_SAS => Self::Sas(reader.read_u16()?.into()),
@@ -677,5 +842,149 @@ impl<S: ContractStateAccess> Bytecode for ContractOp<S> {
 
             x => Self::Fail(x, PhantomData),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Borrow;
+
+    use aluvm::data::ByteStr;
+    use aluvm::isa::Bytecode;
+    use aluvm::library::{Cursor, LibSeg};
+    use amplify::num::u4;
+    use bitcoin::OutPoint as Outpoint;
+
+    use super::*;
+    use crate::vm::{GlobalsIter, UnknownGlobalStateType};
+    use crate::vm::GlobalStateEntry;
+    use crate::{FungibleState, RevealedData};
+
+    #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+    struct DummyState;
+
+    impl GlobalsIter for std::iter::Empty<GlobalStateEntry> {
+        fn at_depth(&self, _depth: usize) -> Option<Self::Item> { None }
+    }
+
+    impl ContractStateAccess for DummyState {
+        fn global(
+            &self,
+            ty: GlobalStateType,
+        ) -> Result<
+            impl GlobalsIter<Item = impl Borrow<GlobalStateEntry>>,
+            UnknownGlobalStateType,
+        > {
+            Err::<std::iter::Empty<GlobalStateEntry>, _>(UnknownGlobalStateType(ty))
+        }
+        fn rights(&self, _outpoint: Outpoint, _ty: AssignmentType) -> u32 { 0 }
+        fn fungible(
+            &self,
+            _outpoint: Outpoint,
+            _ty: AssignmentType,
+        ) -> impl DoubleEndedIterator<Item = FungibleState> {
+            std::iter::empty()
+        }
+        fn data(
+            &self,
+            _outpoint: Outpoint,
+            _ty: AssignmentType,
+        ) -> impl DoubleEndedIterator<Item = impl Borrow<RevealedData>> {
+            std::iter::empty::<RevealedData>()
+        }
+    }
+
+    type TestOp = ContractOp<DummyState>;
+
+    fn roundtrip(op: TestOp) -> TestOp {
+        let libseg = LibSeg::default();
+        let mut code = [0u8; 16];
+        {
+            let mut cursor = Cursor::<_, ByteStr>::new(&mut code[..], &libseg);
+            cursor.write_u8(op.instr_byte()).unwrap();
+            op.encode_args(&mut cursor).unwrap();
+        }
+        let mut cursor = Cursor::<_, ByteStr>::new(&code[..], &libseg);
+        TestOp::decode(&mut cursor).unwrap()
+    }
+
+    #[test]
+    fn ldof_roundtrip() {
+        let op = TestOp::LdOF(
+            AssignmentType::from(42u16),
+            Reg16::from(u4::with(1)),
+            Reg16::from(u4::with(2)),
+            Reg16::from(u4::with(3)),
+            Reg16::from(u4::with(4)),
+        );
+        assert_eq!(roundtrip(op), op);
+    }
+
+    #[test]
+    fn ldod_roundtrip() {
+        let op = TestOp::LdOD(
+            AssignmentType::from(100u16),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(5)),
+            Reg16::from(u4::with(7)),
+            RegS::from(u4::with(3)),
+        );
+        assert_eq!(roundtrip(op), op);
+    }
+
+    #[test]
+    fn ldor_roundtrip() {
+        let op = TestOp::LdOR(
+            AssignmentType::from(7u16),
+            Reg16::from(u4::with(2)),
+            Reg16::from(u4::with(3)),
+            Reg16::from(u4::with(8)),
+        );
+        assert_eq!(roundtrip(op), op);
+    }
+
+    #[test]
+    fn ldc_roundtrip_unchanged() {
+        let op = TestOp::LdC(
+            GlobalStateType::from(10u16),
+            Reg16::from(u4::with(5)),
+            RegS::from(u4::with(2)),
+        );
+        assert_eq!(roundtrip(op), op);
+    }
+
+    #[test]
+    fn ldof_instr_byte() {
+        let op = TestOp::LdOF(
+            AssignmentType::from(0u16),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(0)),
+        );
+        assert_eq!(op.instr_byte(), INSTR_LDOF);
+    }
+
+    #[test]
+    fn ldod_instr_byte() {
+        let op = TestOp::LdOD(
+            AssignmentType::from(0u16),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(0)),
+            RegS::from(u4::with(0)),
+        );
+        assert_eq!(op.instr_byte(), INSTR_LDOD);
+    }
+
+    #[test]
+    fn ldor_instr_byte() {
+        let op = TestOp::LdOR(
+            AssignmentType::from(0u16),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(0)),
+            Reg16::from(u4::with(0)),
+        );
+        assert_eq!(op.instr_byte(), INSTR_LDOR);
     }
 }

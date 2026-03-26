@@ -41,6 +41,9 @@ pub const INSTR_LDF: u8 = 0b11_000_110;
 pub const INSTR_LDG: u8 = 0b11_001_000;
 pub const INSTR_LDC: u8 = 0b11_001_001;
 pub const INSTR_LDM: u8 = 0b11_001_010;
+pub const INSTR_LDOF: u8 = 0b11_001_011;
+pub const INSTR_LDOD: u8 = 0b11_001_100;
+pub const INSTR_LDOR: u8 = 0b11_001_101;
 // Reserved 0b11_001_111
 
 pub const INSTR_SVS: u8 = 0b11_010_000;
