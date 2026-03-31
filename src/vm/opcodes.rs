@@ -36,7 +36,7 @@ pub const INSTR_CNC: u8 = 0b11_000_011;
 pub const INSTR_LDP: u8 = 0b11_000_100;
 pub const INSTR_LDS: u8 = 0b11_000_101;
 pub const INSTR_LDF: u8 = 0b11_000_110;
-// Reserved 0b11_000_111
+pub const INSTR_LDR: u8 = 0b11_000_111;
 
 pub const INSTR_LDG: u8 = 0b11_001_000;
 pub const INSTR_LDC: u8 = 0b11_001_001;

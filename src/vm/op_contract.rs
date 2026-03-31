@@ -109,6 +109,16 @@ pub enum ContractOp<S: ContractStateAccess> {
     #[display("ldf     {0},a16{1},a64{2}")]
     LdF(AssignmentType, Reg16, Reg16),
 
+    /// Checks owned declarative state with type id from the first argument and
+    /// index from the second argument `a16` register.
+    ///
+    /// Since declarative assignments don't carry payload data, this operation
+    /// does not write destination registers and reports result through `st0`.
+    /// On missing state, wrong state class or out-of-range index it sets
+    /// `st0` to `false` and continues execution.
+    #[display("ldr     {0},a16{1}")]
+    LdR(AssignmentType, Reg16),
+
     /// Loads global state from the current operation with type id from the
     /// first argument and index from the second argument `a8` register into a
     /// register provided in the third argument.
@@ -226,6 +236,7 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
         match self {
             ContractOp::LdP(_, reg, _)
             | ContractOp::LdF(_, reg, _)
+            | ContractOp::LdR(_, reg)
             | ContractOp::LdS(_, reg, _) => bset![Reg::A(RegA::A16, (*reg).into())],
             ContractOp::LdG(_, reg, _) => bset![Reg::A(RegA::A8, (*reg).into())],
             ContractOp::LdC(_, reg, _) => bset![Reg::A(RegA::A32, (*reg).into())],
@@ -276,7 +287,7 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
             | ContractOp::LdOD(_, _, _, _, reg) => {
                 bset![Reg::S(*reg)]
             }
-            ContractOp::Svs(_) | ContractOp::Sas(_) | ContractOp::Sps(_) => {
+            ContractOp::LdR(_, _) | ContractOp::Svs(_) | ContractOp::Sas(_) | ContractOp::Sps(_) => {
                 bset![]
             }
             ContractOp::Vts(reg) => bset![Reg::S(*reg)],
@@ -293,6 +304,7 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
             ContractOp::LdP(_, _, _)
             | ContractOp::LdS(_, _, _)
             | ContractOp::LdF(_, _, _)
+            | ContractOp::LdR(_, _)
             | ContractOp::LdG(_, _, _)
             | ContractOp::LdC(_, _, _)
             | ContractOp::LdOF(_, _, _, _, _)
@@ -439,6 +451,22 @@ impl<S: ContractStateAccess> InstructionSet for ContractOp<S> {
                     fail!()
                 };
                 regs.set_n(RegA::A64, *reg, state.as_inner().as_u64());
+            }
+            ContractOp::LdR(state_type, reg_32) => {
+                let Some(reg_32) = *regs.get_n(RegA::A16, *reg_32) else {
+                    regs.set_failure();
+                    return ExecStep::Next;
+                };
+                let index: u16 = reg_32.into();
+
+                let Some(typed_assigns) = context.op_info.owned_state().get(*state_type) else {
+                    regs.set_failure();
+                    return ExecStep::Next;
+                };
+                if !typed_assigns.is_declarative() || index >= typed_assigns.len_u16() {
+                    regs.set_failure();
+                    return ExecStep::Next;
+                }
             }
             ContractOp::LdG(state_type, reg_8, reg_s) => {
                 let Some(reg_32) = *regs.get_n(RegA::A8, *reg_8) else {
@@ -650,6 +678,7 @@ impl<S: ContractStateAccess> Bytecode for ContractOp<S> {
             ContractOp::LdS(_, _, _) => INSTR_LDS,
             ContractOp::LdP(_, _, _) => INSTR_LDP,
             ContractOp::LdF(_, _, _) => INSTR_LDF,
+            ContractOp::LdR(_, _) => INSTR_LDR,
             ContractOp::LdC(_, _, _) => INSTR_LDC,
             ContractOp::LdM(_, _) => INSTR_LDM,
             ContractOp::LdOF(_, _, _, _, _) => INSTR_LDOF,
@@ -703,6 +732,11 @@ impl<S: ContractStateAccess> Bytecode for ContractOp<S> {
                 writer.write_u16(*state_type)?;
                 writer.write_u4(reg_a)?;
                 writer.write_u4(reg_dst)?;
+            }
+            ContractOp::LdR(state_type, reg_a) => {
+                writer.write_u16(*state_type)?;
+                writer.write_u4(reg_a)?;
+                writer.write_u4(u4::ZERO)?;
             }
             ContractOp::LdG(state_type, reg_a, reg_s) => {
                 writer.write_u16(*state_type)?;
@@ -789,6 +823,11 @@ impl<S: ContractStateAccess> Bytecode for ContractOp<S> {
                 reader.read_u4()?.into(),
                 reader.read_u4()?.into(),
             ),
+            INSTR_LDR => {
+                let i = Self::LdR(reader.read_u16()?.into(), reader.read_u4()?.into());
+                reader.read_u4()?; // Discard padding bits
+                i
+            }
             INSTR_LDG => Self::LdG(
                 reader.read_u16()?.into(),
                 reader.read_u4()?.into(),
@@ -944,6 +983,15 @@ mod tests {
     }
 
     #[test]
+    fn ldr_roundtrip() {
+        let op = TestOp::LdR(
+            AssignmentType::from(11u16),
+            Reg16::from(u4::with(6)),
+        );
+        assert_eq!(roundtrip(op), op);
+    }
+
+    #[test]
     fn ldc_roundtrip_unchanged() {
         let op = TestOp::LdC(
             GlobalStateType::from(10u16),
@@ -986,5 +1034,14 @@ mod tests {
             Reg16::from(u4::with(0)),
         );
         assert_eq!(op.instr_byte(), INSTR_LDOR);
+    }
+
+    #[test]
+    fn ldr_instr_byte() {
+        let op = TestOp::LdR(
+            AssignmentType::from(0u16),
+            Reg16::from(u4::with(0)),
+        );
+        assert_eq!(op.instr_byte(), INSTR_LDR);
     }
 }

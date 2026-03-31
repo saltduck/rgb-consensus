@@ -69,6 +69,12 @@ macro_rules! isa_instr {
     (lds $t:ident,a16[$a_idx:literal],s16[$s_idx:literal]) => {{
         RgbIsa::Contract(ContractOp::LdS($t, Reg16::from(u4::with($a_idx)), RegS::from($s_idx)))
     }};
+    (ldf $t:ident,a16[$a_idx:literal],a64[$dst_idx:literal]) => {{
+        RgbIsa::Contract(ContractOp::LdF($t, Reg16::from(u4::with($a_idx)), Reg16::from(u4::with($dst_idx))))
+    }};
+    (ldr $t:ident,a16[$a_idx:literal]) => {{
+        RgbIsa::Contract(ContractOp::LdR($t, Reg16::from(u4::with($a_idx))))
+    }};
     (ldof $t:ident,r256[$txid_idx:literal],a32[$vout_idx:literal],a16[$idx:literal],a64[$dst:literal]) => {{
         RgbIsa::Contract(ContractOp::LdOF($t, Reg16::from(u4::with($txid_idx)), Reg16::from(u4::with($vout_idx)), Reg16::from(u4::with($idx)), Reg16::from(u4::with($dst))))
     }};
